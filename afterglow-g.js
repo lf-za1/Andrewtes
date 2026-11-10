@@ -1498,6 +1498,19 @@ async function attempt(ctx, opts) {
     say("debug menu enabled -- go to Settings");
   })();
 
+  /* ---- Load debug.bin payload ---- */
+  say("[p] Attempting to load debug.bin");
+  try {
+    iface.payload = await loadPayload("debug.bin");
+    if (iface.payload) {
+      say("[p] debug.bin loaded successfully");
+    } else {
+      say("[p] debug.bin failed to load");
+    }
+  } catch (e) {
+    say("[p] Error loading debug.bin: " + (e && e.message));
+  }
+
   say("done -- jailbroken, rwx open, debug settings enabled");
   say("========================================");
   say("  JAILBREAK COMPLETE -- FW " + (host().state && host().state.fw ? host().state.fw : "14.xx"));
@@ -1507,6 +1520,104 @@ async function attempt(ctx, opts) {
   return iface;
 }
 
+/* ------------------------------------------------------- Payload Loader */
+
+async function fetchBytes(url, tag) {
+  try {
+    const r = await fetch(url + (url.indexOf("?") < 0 ? "?" : "&") + "_=" + Date.now());
+    if (!r.ok) { say("[" + tag + "] " + url + " HTTP " + r.status); return null; }
+    return new Uint8Array(await r.arrayBuffer());
+  } catch (e) {
+    say("[" + tag + "] " + url + " unreachable: " + (e && e.message));
+    return null;
+  }
+}
+
+async function loadPayload(url, vorab) {
+  const c = host();
+  let blob = vorab || null;
+  if (blob === null) {
+    blob = await fetchBytes(url, "p");
+    if (blob === null) return false;
+  }
+
+  if (!blob.length) { say("[p] " + url + " is empty"); return false; }
+  if (blob[0] !== 0xe9) {
+    say("[p] " + url + " does not start with a jmp -- not a raw payload, refusing");
+    return false;
+  }
+
+  const size = (blob.length + 0x3fff) & ~0x3fff;
+  const m = sc(S.mmap, 0, size, 3, 0x1002, -1, 0);
+  const entry = v(m.lo, m.hi);
+  if (m.i32 === -1 || (entry.hi >>> 0) === 0) {
+    say("[p] mmap failed, errno " + c.errno()); return false;
+  }
+  
+  for (let o = 0; o < size; o += 0x1000) wr4(plus(entry, o), 0);
+  if (sc(S.mprotect, entry, size, 7).i32 !== 0) {
+    say("[p] mprotect rwx failed, errno " + c.errno()); return false;
+  }
+  codeAt(entry, 0).hex("c3");
+  const probe = c.callAddr(entry, []);
+  if (probe === undefined || probe === null) {
+    say("[p] entry page does not execute in ring 3 -- stopping"); return false;
+  }
+  say("[p] entry page executes in ring 3, loading payload");
+
+  for (let o = 0; o < blob.length; o += 8) {
+    let lo = 0, hi = 0;
+    for (let k = 0; k < 4; k++) lo |= (blob[o + k] || 0) << (8 * k);
+    for (let k = 0; k < 4; k++) hi |= (blob[o + 4 + k] || 0) << (8 * k);
+    c.p.write8(plus(entry, o), v(lo >>> 0, hi >>> 0));
+  }
+  for (let o = 0; o < blob.length; o += 8) {
+    let lo = 0, hi = 0;
+    for (let k = 0; k < 4; k++) lo |= (blob[o + k] || 0) << (8 * k);
+    for (let k = 0; k < 4; k++) hi |= (blob[o + 4 + k] || 0) << (8 * k);
+    const q = c.p.read8(plus(entry, o));
+    if ((q.low >>> 0) !== (lo >>> 0) || (q.hi >>> 0) !== (hi >>> 0)) {
+      say("[p] copy mismatch at 0x" + o.toString(16)); return false;
+    }
+  }
+  
+  for (let o = 0; o < 10; o++) wr1(plus(entry, 0x1068 + o), 0x90);
+  wr1(plus(entry, 0x3490), 0x00); wr1(plus(entry, 0x3491), 0x0d);
+  wr1(plus(entry, 0x3492), 0x52); wr1(plus(entry, 0x3493), 0x01);
+  say("[p] console-output write NOP'd (0x1068), M_TEMP -> 0x1520d00 (0x3490)");
+  
+  for (let o = 0; o < 4; o++) wr1(plus(entry, 0x1136 + o), 0x90);
+  say("[p] kpayload entry call NOP'd (0x1136) -- loader-only run");
+  say("[p] payload copied and verified, starting thread");
+
+  const SLOT_1352 = 0x3cb9c00;
+  const slot = (c.off && c.off.wk___imp_pthread_create !== undefined)
+    ? c.off.wk___imp_pthread_create : SLOT_1352;
+  if (!c.webkitBase || !c.libkernelBase) {
+    say("[p] no module bases -- payload sits loaded at " + text(entry) + ", not started");
+    return false;
+  }
+  const fnr = c.p.read8(c.webkitBase.add32(slot));
+  const fn = v(fnr.low, fnr.hi);
+  const d = (fn.hi - (c.libkernelBase.hi >>> 0)) * LOW + (fn.low - (c.libkernelBase.low >>> 0));
+  if ((fn.hi >>> 0) !== (c.libkernelBase.hi >>> 0) || d <= 0 || d > 0x400000) {
+    say("[p] slot +0x" + slot.toString(16) + " holds " + text(fn)
+        + ", not inside libkernel " + text(c.libkernelBase) + " -- not calling it");
+    return false;
+  }
+  say("[p] pthread_create at " + text(fn) + " = libkernel +0x" + d.toString(16));
+
+  const thr = alloc(8);
+  thr.u8.fill(0);
+  const rc = c.callAddr(fn, [thr.at, 0, entry, 0]).i32;
+  const handle = qAt(thr, 0);
+  const started = rc === 0 && (handle.hi >>> 0) > 0;
+  say("[p] " + blob.length + " bytes at " + text(entry) + ", thread rc=" + rc
+      + (started ? " -- running" : " -- did NOT start"));
+  return started;
+}
+
+/* End of file */
 export async function runAfterglow(ctx, opts) {
   const max = (opts && opts.tries) || 4;
   for (let n = 1; n <= max; n++) {
